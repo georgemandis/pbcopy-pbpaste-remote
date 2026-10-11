@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# pbpaste: print the clipboard of the terminal you are sitting at.
+#
+# Sends an OSC 52 query to the controlling tty and decodes the reply. Most
+# terminals refuse to answer this (a remote program reading your clipboard
+# is a privacy problem), so expect it to work only where you have opted in:
+#   kitty    asks you each time by default (clipboard_control read-clipboard-ask)
+#   Ghostty  asks you each time by default (clipboard-read = ask)
+#   xterm    only with allowWindowOps enabled
+# Inside tmux the terminal's reply never reaches the pane, so pbpaste prints
+# the current tmux paste buffer instead.
+#
+# Environment:
+#   PBPASTE_TIMEOUT  seconds to wait for a reply (default 3)
+set -u
+
+usage() {
+    cat <<'USAGE'
+usage: pbpaste [-h]
+
+Prints your local terminal's clipboard, if the terminal allows OSC 52 reads.
+Inside tmux, prints the tmux paste buffer instead.
+USAGE
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    "") ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+timeout=${PBPASTE_TIMEOUT:-3}
+
+if [[ -n ${TMUX:-} ]]; then
+    exec tmux save-buffer -
+fi
+
+if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+    echo "pbpaste: no controlling terminal" >&2
+    exit 1
+fi
+
+saved=$(stty -g <&3)
+restore() { stty "$saved" <&3; }
+trap restore EXIT
+stty raw -echo <&3
+
+printf '\033]52;c;?\a' >&3
+
+# Reply is  ESC ] 52 ; <selection> ; <base64>  terminated by BEL or ESC \ .
+buf=
+got_any=0
+while IFS= read -r -s -n1 -t "$timeout" ch <&3; do
+    got_any=1
+    [[ $ch == $'\a' ]] && break
+    if [[ $ch == '\' && ${buf: -1} == $'\e' ]]; then
+        buf=${buf%$'\e'}
+        break
+    fi
+    buf+=$ch
+done
+
+restore
+trap - EXIT
+
+if (( ! got_any )); then
+    cat >&2 <<MSG
+pbpaste: no reply from the terminal after ${timeout}s.
+Your terminal probably does not allow programs to read the clipboard (OSC 52
+reads). kitty and Ghostty can be set to ask or allow; most others cannot.
+MSG
+    exit 1
+fi
+
+# Strip "ESC ] 52 ; c ;" however the terminal spelled the selection field.
+buf=${buf#$'\e']52;}
+buf=${buf#*;}
+
+printf '%s' "$buf" | base64 -d

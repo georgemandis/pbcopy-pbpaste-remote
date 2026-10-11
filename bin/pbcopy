@@ -1,0 +1,70 @@
+#!/bin/sh
+# pbcopy: copy stdin to the clipboard of the terminal you are sitting at.
+#
+# Works over SSH. The data is wrapped in an OSC 52 escape sequence and written
+# to the controlling tty; the terminal emulator on your side sets its own
+# system clipboard. Nothing on the remote host touches a clipboard.
+#
+# Environment:
+#   PBCOPY_TTY   device to write to (default /dev/tty). Useful for testing.
+set -eu
+
+usage() {
+    cat <<'USAGE'
+usage: pbcopy [-h]
+
+Reads stdin and copies it to the clipboard of your local terminal via OSC 52.
+Works inside tmux (needs `set -g allow-passthrough on` or `set -g set-clipboard on`)
+and GNU screen. Most terminals cap the payload somewhere around 100 KB.
+USAGE
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    "") ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+tty_dev=${PBCOPY_TTY:-/dev/tty}
+if ! { true >"$tty_dev"; } 2>/dev/null; then
+    # No terminal to talk to (cron, a detached job, ...). If there is a local
+    # display, fall back to its clipboard instead.
+    if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+        if   command -v wl-copy >/dev/null 2>&1; then exec wl-copy
+        elif command -v xclip   >/dev/null 2>&1; then exec xclip -selection clipboard
+        elif command -v xsel    >/dev/null 2>&1; then exec xsel --clipboard --input
+        fi
+    fi
+    echo "pbcopy: no terminal on $tty_dev to send the clipboard through" >&2
+    exit 1
+fi
+
+# base64 without line wrapping. GNU, BSD, BusyBox and uutils all wrap or not
+# differently, so strip newlines rather than rely on a flag.
+data=$(base64 | tr -d '\n')
+
+esc=$(printf '\033')
+bel=$(printf '\a')
+osc="${esc}]52;c;${data}${bel}"
+
+in_tmux_passthrough() {
+    [ -n "${TMUX:-}" ] || return 1
+    case "$(tmux show-options -gv allow-passthrough 2>/dev/null)" in
+        on|all) return 0 ;;
+    esac
+    return 1
+}
+
+if in_tmux_passthrough; then
+    # Wrap in a tmux DCS passthrough; every ESC inside must be doubled.
+    inner=$(printf '%s' "$osc" | sed "s/${esc}/${esc}${esc}/g")
+    printf '\033Ptmux;%s\033\\' "$inner" >"$tty_dev"
+elif case "${TERM:-}" in screen*) true ;; *) false ;; esac; then
+    # GNU screen only passes short DCS chunks through to the outer terminal.
+    printf '%s\n' "$osc" | fold -w 76 | while IFS= read -r chunk; do
+        printf '\033P%s\033\\' "$chunk"
+    done >"$tty_dev"
+else
+    # Plain terminal, or tmux with `set-clipboard on`, which forwards OSC 52 itself.
+    printf '%s' "$osc" >"$tty_dev"
+fi
